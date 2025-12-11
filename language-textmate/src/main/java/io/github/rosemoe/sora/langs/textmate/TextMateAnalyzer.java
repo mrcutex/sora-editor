@@ -245,13 +245,11 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
         int tokenIndex = 0;
         int lineLength = line.length();
         
-        while (utf16Index < lineLength && tokenIndex < tokensLength) {
+        while (tokenIndex < tokensLength) {
             int targetUnicodeOffset = tokens[2 * tokenIndex];
             
-            if (unicodeIndex == targetUnicodeOffset) {
-                offsets[tokenIndex] = utf16Index;
-                tokenIndex++;
-            } else if (unicodeIndex < targetUnicodeOffset) {
+            // Advance utf16Index until we reach the target unicode offset
+            while (unicodeIndex < targetUnicodeOffset && utf16Index < lineLength) {
                 char ch = line.charAt(utf16Index);
                 if (Character.isHighSurrogate(ch) && utf16Index + 1 < lineLength 
                     && Character.isLowSurrogate(line.charAt(utf16Index + 1))) {
@@ -260,14 +258,9 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
                     utf16Index++;
                 }
                 unicodeIndex++;
-            } else {
-                // This shouldn't happen if tokens are sorted
-                break;
             }
-        }
-        
-        // Handle any remaining tokens at end of line
-        while (tokenIndex < tokensLength) {
+            
+            // Record the UTF-16 offset for this token
             offsets[tokenIndex] = utf16Index;
             tokenIndex++;
         }
