@@ -261,7 +261,9 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
             }
             
             // Record the UTF-16 offset for this token
-            offsets[tokenIndex] = utf16Index;
+            // If we couldn't reach the target (went past end of string), use the target offset
+            // This matches the behavior of the original StringUtils.convertUnicodeOffsetToUtf16
+            offsets[tokenIndex] = (unicodeIndex == targetUnicodeOffset) ? utf16Index : targetUnicodeOffset;
             tokenIndex++;
         }
         
