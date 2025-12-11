@@ -43,7 +43,9 @@ import org.eclipse.tm4e.languageconfiguration.internal.model.LanguageConfigurati
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import io.github.rosemoe.sora.lang.analysis.AsyncIncrementalAnalyzeManager;
@@ -80,6 +82,13 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
     private boolean foldingOffside;
     private BracketsProvider bracketsProvider;
     final IdentifierAutoComplete.SyncIdentifiers syncIdentifiers = new IdentifierAutoComplete.SyncIdentifiers();
+
+    // Performance optimization: ThreadLocal pools for reusable objects
+    private static final ThreadLocal<ArrayList<Span>> SPAN_LIST_POOL = ThreadLocal.withInitial(ArrayList::new);
+    private static final ThreadLocal<ArrayList<String>> IDENTIFIER_LIST_POOL = ThreadLocal.withInitial(ArrayList::new);
+    
+    // Performance optimization: Cache for parsed colors to avoid repeated Color.parseColor calls
+    private final Map<Integer, Integer> colorCache = new HashMap<>();
 
 
     public TextMateAnalyzer(TextMateLanguage language, IGrammar grammar, LanguageConfiguration languageConfiguration,/* GrammarRegistry grammarRegistry,*/ ThemeRegistry themeRegistry) {
@@ -204,17 +213,92 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
         getManagedStyles().setIndentCountMode(true);
     }
 
+    /**
+     * Performance optimization: Precompute UTF-16 offsets for all tokens in one pass
+     * to avoid O(n²) complexity from repeated conversions.
+     * 
+     * This method efficiently converts unicode offsets to UTF-16 offsets by doing a single
+     * pass through the line string, avoiding the O(n²) behavior of repeatedly calling
+     * convertUnicodeOffsetToUtf16 for each token.
+     * 
+     * @param line The line text
+     * @param tokens The token array from grammar (alternating start/metadata pairs)
+     * @param tokensLength Number of tokens
+     * @param hasSurrogate Whether the line contains surrogate pairs
+     * @return Array of UTF-16 offsets for each token start position
+     */
+    private int[] precomputeUtf16Offsets(String line, int[] tokens, int tokensLength, boolean hasSurrogate) {
+        int[] offsets = new int[tokensLength];
+        
+        if (!hasSurrogate) {
+            // Fast path: no surrogates, offsets are identity mapping
+            for (int i = 0; i < tokensLength; i++) {
+                offsets[i] = tokens[2 * i];
+            }
+            return offsets;
+        }
+        
+        // Optimized single-pass conversion for surrogate pairs
+        // Build a mapping by walking through the string once
+        int utf16Index = 0;
+        int unicodeIndex = 0;
+        int tokenIndex = 0;
+        int lineLength = line.length();
+        
+        while (utf16Index < lineLength && tokenIndex < tokensLength) {
+            int targetUnicodeOffset = tokens[2 * tokenIndex];
+            
+            if (unicodeIndex == targetUnicodeOffset) {
+                offsets[tokenIndex] = utf16Index;
+                tokenIndex++;
+            } else if (unicodeIndex < targetUnicodeOffset) {
+                char ch = line.charAt(utf16Index);
+                if (Character.isHighSurrogate(ch) && utf16Index + 1 < lineLength 
+                    && Character.isLowSurrogate(line.charAt(utf16Index + 1))) {
+                    utf16Index += 2;
+                } else {
+                    utf16Index++;
+                }
+                unicodeIndex++;
+            } else {
+                // This shouldn't happen if tokens are sorted
+                break;
+            }
+        }
+        
+        // Handle any remaining tokens at end of line
+        while (tokenIndex < tokensLength) {
+            offsets[tokenIndex] = utf16Index;
+            tokenIndex++;
+        }
+        
+        return offsets;
+    }
+
     @Override
     @SuppressLint("NewApi")
     public synchronized LineTokenizeResult<MyState, Span> tokenizeLine(CharSequence lineC, MyState state, int lineIndex) {
         String line = (lineC instanceof ContentLine) ? ((ContentLine) lineC).toStringWithNewline() : lineC.toString();
-        var tokens = new ArrayList<Span>();
+        
+        // Performance optimization: Reuse ArrayList instances from ThreadLocal pool
+        var tokens = SPAN_LIST_POOL.get();
+        tokens.clear();
+        
         var surrogate = StringUtils.checkSurrogate(line);
         var lineTokens = grammar.tokenizeLine2(line, state == null ? null : state.tokenizeState, Duration.ofSeconds(2));
         int tokensLength = lineTokens.getTokens().length / 2;
-        var identifiers = language.createIdentifiers ? new ArrayList<String>() : null;
+        
+        // Performance optimization: Precompute all UTF-16 offsets at once
+        int[] utf16Offsets = precomputeUtf16Offsets(line, lineTokens.getTokens(), tokensLength, surrogate);
+        
+        // Performance optimization: Reuse identifier list from ThreadLocal pool
+        var identifiers = language.createIdentifiers ? IDENTIFIER_LIST_POOL.get() : null;
+        if (identifiers != null) {
+            identifiers.clear();
+        }
+        
         for (int i = 0; i < tokensLength; i++) {
-            int startIndex = StringUtils.convertUnicodeOffsetToUtf16(line, lineTokens.getTokens()[2 * i], surrogate);
+            int startIndex = utf16Offsets[i];
             if (i == 0 && startIndex != 0) {
                 tokens.add(SpanFactory.obtainNoExt(0, EditorColorScheme.TEXT_NORMAL));
             }
@@ -225,7 +309,7 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
             if (language.createIdentifiers) {
 
                 if (tokenType == StandardTokenType.Other) {
-                    var end = i + 1 == tokensLength ? lineC.length() : StringUtils.convertUnicodeOffsetToUtf16(line, lineTokens.getTokens()[2 * (i + 1)], surrogate);
+                    var end = i + 1 == tokensLength ? lineC.length() : utf16Offsets[i + 1];
                     if (end > startIndex && MyCharacter.isJavaIdentifierStart(line.charAt(startIndex))) {
                         var flag = true;
                         for (int j = startIndex + 1; j < end; j++) {
@@ -245,15 +329,28 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
             span.setExtra(tokenType);
 
             if ((fontStyle & FontStyle.Underline) != 0) {
-                String color = theme.getColor(foreground);
-                if (color != null) {
-                    span.setUnderlineColor(Color.parseColor(color));
+                // Performance optimization: Use cached parsed color to avoid repeated Color.parseColor calls
+                Integer cachedColor = colorCache.get(foreground);
+                if (cachedColor == null) {
+                    String color = theme.getColor(foreground);
+                    if (color != null) {
+                        cachedColor = Color.parseColor(color);
+                        colorCache.put(foreground, cachedColor);
+                    }
+                }
+                if (cachedColor != null) {
+                    span.setUnderlineColor(cachedColor);
                 }
             }
 
             tokens.add(span);
         }
-        return new LineTokenizeResult<>(new MyState(lineTokens.getRuleStack(), cachedRegExp == null ? null : cachedRegExp.search(OnigString.of(line), 0), IndentRange.computeIndentLevel(((ContentLine) lineC).getBackingCharArray(), line.length() - 1, language.getTabSize()), identifiers), null, tokens);
+        
+        // Create a copy of the lists for the state since we're reusing the ThreadLocal instances
+        var tokensCopy = new ArrayList<>(tokens);
+        var identifiersCopy = identifiers != null ? new ArrayList<>(identifiers) : null;
+        
+        return new LineTokenizeResult<>(new MyState(lineTokens.getRuleStack(), cachedRegExp == null ? null : cachedRegExp.search(OnigString.of(line), 0), IndentRange.computeIndentLevel(((ContentLine) lineC).getBackingCharArray(), line.length() - 1, language.getTabSize()), identifiersCopy), null, tokensCopy);
     }
 
     @Override
@@ -296,5 +393,7 @@ public class TextMateAnalyzer extends AsyncIncrementalAnalyzeManager<MyState, Sp
     @Override
     public void onChangeTheme(ThemeModel newTheme) {
         this.theme = newTheme.getTheme();
+        // Clear color cache when theme changes since color values will be different
+        colorCache.clear();
     }
 }
